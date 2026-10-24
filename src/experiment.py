@@ -1,216 +1,25 @@
-import hashlib
-import json
-import logging
-import os
-import re
-import threading
-import time
+import hashlib, logging, re, os, json, time 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass 
+from dataclasses import asdict
 from typing import Any
-
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import pearsonr, wasserstein_distance
 
-log = logging.getLogger("dist_align")
+from . import ExperimentConfig, ResponseCache 
 
-STRATEGIES = (
-    "direct",  # control: one Yes/No answer per call
-    "verbalized",  # 1. verbalized distribution
-    "population",  # 3. population framing
-    "knowledge_restriction",  # 5. persona-consistent knowledge restriction
-    "paraphrase",  # 6. LLM-generated diverse persona paraphrases
-    "fewshot_self",  # 4a. twin's own wave 3 pricing answers as few-shot
-)
+
+log = logging.getLogger("dist_align")
 
 # Strategies that return a probability. They are evaluated on the probability
 # itself (no Bernoulli sampling noise) and need fewer calls per item.
 PROB_STRATEGIES = {"verbalized", "population", "fewshot_self"}
 
-# Coarse price bins (share of regular price) for small test sets.
-DEFAULT_PRICE_BINS = (
-    ("0-40%", 0.0, 0.4),
-    ("60-100%", 0.6, 1.0),
-    ("120-160%", 1.2, 1.6),
-    ("180-200%", 1.8, 2.0),
-)
-
-DEFAULT_RESTRICTION = (
-    "This person does not know typical retail prices or what other stores "
-    "charge beyond their own everyday shopping experience. They have no "
-    "training in economics or marketing and decide quickly, by gut feeling, "
-    "as they would in a real store. Do not use knowledge, calculations, or "
-    "price comparisons this person would not make."
-)
-
-
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-@dataclass
-class ExperimentConfig:
-    model: str = "gpt-4.1-mini"
-    temperature: float | None = 1.0  # None = omit (needed for reasoning models)
-    n_samples: int = 5  # calls per twin x item, all strategies
-    strategies: tuple = STRATEGIES
-    persona_mode: str = "blocks"  # "demographics" | "blocks" | "full_text"
-    persona_blocks: tuple = ("Demographics", "Economic preferences")
-    max_persona_chars: int = 20000
-    condition_key: str = (
-        "price_bin"  # "price_bin" | "price_level" | "product" | "product_price"
-    )
-    price_bins: tuple = DEFAULT_PRICE_BINS
-    prob_samples: int = 1  # calls per item for probability strategies
-    fewshot_k: int = 10  # wave 3 examples shown in fewshot_self
-    json_mode: bool = True  # force JSON output for JSON-returning prompts
-    population_size: int = 100
-    knowledge_restriction_text: str = DEFAULT_RESTRICTION
-    n_bootstrap: int = 1000
-    n_baseline_reps: int = 200  # simulation reps for baseline heterogeneity
-    seed: int = 42
-    max_workers: int = 8
-    max_retries: int = 2
-    max_output_tokens: int = 200
-    cache_path: str | None = "cache/llm_cache.jsonl"
-    output_dir: str = "results"
-
-
-# --------------------------------------------------------------------------- #
-# LLM clients
-# --------------------------------------------------------------------------- #
-class OpenAIClient:
-    """Thin wrapper around the OpenAI Responses API."""
-
-    def __init__(self, model: str, max_retries: int = 2):
-        from openai import OpenAI  # imported lazily so mock runs need no SDK
-
-        self.client = OpenAI()  # reads OPENAI_API_KEY from the environment
-        self.model = model
-        self.max_retries = max_retries
-
-    def complete(
-        self,
-        system: str,
-        user: str,
-        temperature: float | None,
-        max_output_tokens: int,
-        json_mode: bool = False,
-    ) -> str:
-        kwargs: dict[str, Any] = dict(
-            model=self.model,
-            instructions=system,
-            input=user,
-            max_output_tokens=max(16, max_output_tokens),
-        )
-        if json_mode:
-            kwargs["text"] = {"format": {"type": "json_object"}}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        for attempt in range(self.max_retries + 1):
-            try:
-                return self.client.responses.create(**kwargs).output_text
-            except Exception as exc:  # noqa: BLE001
-                if attempt == self.max_retries:
-                    raise
-                wait = 2**attempt
-                log.warning("API error (%s); retrying in %ss", exc, wait)
-                time.sleep(wait)
-        return ""
-
-
-class MockClient:
-    """Offline stand-in that returns well-formed answers for plumbing tests.
-
-    It deliberately behaves like a collapsed simulator (price-driven, little
-    person-level variation), so its numbers mean nothing scientifically.
-    """
-
-    model = "mock"
-
-    def __init__(self, seed: int = 0):
-        self._lock = threading.Lock()
-        self._rng = np.random.default_rng(seed)
-
-    def _p(self, prompt: str) -> float:
-        m = re.search(r"priced at:\s*\$([0-9]+(?:\.[0-9]+)?)", prompt)
-        price = float(m.group(1)) if m else 3.0
-        return float(1 / (1 + np.exp(0.6 * (price - 4.0))))
-
-    def complete(
-        self, system, user, temperature=None, max_output_tokens=200, json_mode=False
-    ):
-        with self._lock:
-            r = self._rng.random()
-        if "different descriptions" in user:
-            k = int(re.search(r"Write (\d+)", user).group(1))
-            return json.dumps(
-                {"personas": [f"Variant {i}: same person." for i in range(k)]}
-            )
-        p = self._p(user)
-        if "people who all match" in user:
-            n = int(re.search(r"Imagine (\d+)", user).group(1))
-            buy = int(round(n * np.clip(p + 0.05 * (r - 0.5), 0, 1)))
-            return json.dumps({"purchase": buy, "not_purchase": n - buy})
-        if "probability" in user:
-            q = round(float(np.clip(p + 0.05 * (r - 0.5), 0, 1)), 2)
-            return json.dumps({"yes": q, "no": round(1 - q, 2)})
-        return "Yes" if r < 0.9 * p + 0.05 else "No"
-
-
-# --------------------------------------------------------------------------- #
-# Response cache (thread-safe, append-only JSONL)
-# --------------------------------------------------------------------------- #
-class ResponseCache:
-    def __init__(self, path: str | None):
-        self.path = path
-        self._data: dict[str, str] = {}
-        self._lock = threading.Lock()
-        if path and os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        rec = json.loads(line)
-                        self._data[rec["key"]] = rec["text"]
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-        if path:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-
-    def get(self, key: str) -> str | None:
-        return self._data.get(key)
-
-    def set(self, key: str, text: str) -> None:
-        with self._lock:
-            self._data[key] = text
-            if self.path:
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"key": key, "text": text}) + "\n")
-
-
-# --------------------------------------------------------------------------- #
-# Regexes for the pricing question text
-# --------------------------------------------------------------------------- #
-PRICE_RE = re.compile(r"priced at:?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.I)
-CATEGORY_RE = re.compile(r"product category:\s*(.*?)\.?\s*Suppose", re.I | re.S)
-PRODUCT_RE = re.compile(
-    r"in that category:\s*(.*?)\.?\s*The product is priced", re.I | re.S
-)
-TAG_RE = re.compile(r"<[^>]+>")
-
 
 def _clean(text: Any) -> str:
+    TAG_RE = re.compile(r"<[^>]+>")
     return re.sub(r"\s+", " ", TAG_RE.sub(" ", str(text or ""))).strip()
-
-
-def _maybe_json(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return None
-    return value
 
 
 def _iter_questions(obj: Any, block: str | None = None):
@@ -227,16 +36,13 @@ def _iter_questions(obj: Any, block: str | None = None):
             yield from _iter_questions(v, block)
 
 
-# --------------------------------------------------------------------------- #
-# Main experiment class
-# --------------------------------------------------------------------------- #
 class DistributionAlignmentExperiment:
     """Load Twin-2K-500 pricing data, run prompting strategies, and evaluate."""
 
-    def __init__(self, config: ExperimentConfig | None = None, client: Any = None):
-        self.cfg = config or ExperimentConfig()
+    def __init__(self, config: ExperimentConfig, client: Any = None):
+        self.config = config
         self.client = client
-        self.cache = ResponseCache(self.cfg.cache_path)
+        self.cache = ResponseCache(self.config.cache_path)
         self.raw: pd.DataFrame | None = None
         self.items: pd.DataFrame | None = None  # wave 4 ground truth
         self.retest_items: pd.DataFrame | None = None  # wave 3 answers
@@ -286,12 +92,26 @@ class DistributionAlignmentExperiment:
             len(self.items),
             self.items.product_id.nunique(),
         )
-        return self.items
+        return self.items 
+
+    @staticmethod
+    def _to_json(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return None
+        return value
 
     def _extract_pricing(self, df: pd.DataFrame, column: str) -> pd.DataFrame:
         rows = []
+        PRICE_RE = re.compile(r"priced at:?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.I)
+        CATEGORY_RE = re.compile(r"product category:\s*(.*?)\.?\s*Suppose", re.I | re.S)
+        PRODUCT_RE = re.compile(
+            r"in that category:\s*(.*?)\.?\s*The product is priced", re.I | re.S
+        )
         for pid, blob in zip(df["pid"], df[column]):
-            for _, q in _iter_questions(_maybe_json(blob)):
+            for ll, q in _iter_questions(self._to_json(blob)):
                 text = _clean(q.get("QuestionText"))
                 pm = PRICE_RE.search(text)
                 if not pm:
@@ -351,11 +171,11 @@ class DistributionAlignmentExperiment:
             f["condition"] = self._condition_of(f)
 
     def _condition_of(self, f: pd.DataFrame) -> pd.Series:
-        key = self.cfg.condition_key
+        key = self.config.condition_key
         if key == "price_bin":
 
             def to_bin(r):  # numbered labels keep bins in price order when sorted
-                for i, (label, lo, hi) in enumerate(self.cfg.price_bins, 1):
+                for i, (label, lo, hi) in enumerate(self.config.price_bins, 1):
                     if lo - 1e-9 <= r <= hi + 1e-9:
                         return f"{i}: {label}"
                 return "other"
@@ -371,8 +191,9 @@ class DistributionAlignmentExperiment:
 
     def inspect_pricing_items(self, n: int = 2) -> None:
         """Print raw pricing questions so you can verify the parser."""
-        blob = _maybe_json(self.raw.iloc[0]["wave4_Q_wave4_A"])
+        blob = self._to_json(self.raw.iloc[0]["wave4_Q_wave4_A"])
         shown = 0
+        PRICE_RE = re.compile(r"priced at:?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.I)
         for block, q in _iter_questions(blob):
             if PRICE_RE.search(_clean(q.get("QuestionText"))):
                 print(f"[block: {block}]")
@@ -394,7 +215,7 @@ class DistributionAlignmentExperiment:
         seed: int | None = None,
     ) -> pd.DataFrame:
         """Pick a small random subset of twins and products for testing."""
-        rng = np.random.default_rng(self.cfg.seed if seed is None else seed)
+        rng = np.random.default_rng(self.config.seed if seed is None else seed)
         all_pids = sorted(self.items["pid"].unique())
         all_prods = sorted(self.items["product_id"].unique())
         pids = pids or list(
@@ -425,16 +246,19 @@ class DistributionAlignmentExperiment:
         if pid in self._personas:
             return self._personas[pid]
         row = self.raw.loc[pid]
-        if self.cfg.persona_mode == "full_text":
+        if self.config.persona_mode == "full_text":
             text = str(row["wave1_3_persona_text"])
         else:
             blocks = (
                 ("Demographics",)
-                if self.cfg.persona_mode == "demographics"
-                else self.cfg.persona_blocks
+                if self.config.persona_mode == "demographics"
+                else self.config.persona_blocks
             )
             lines, seen = [], set()
-            for block, q in _iter_questions(_maybe_json(row["wave1_3_persona_json"])):
+            PRICE_RE = re.compile(
+                r"priced at:?\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)", re.I
+            )
+            for block, q in _iter_questions(self._to_json(row["wave1_3_persona_json"])):
                 seen.add(block)
                 qtext = _clean(q.get("QuestionText"))
                 if block not in blocks or not qtext or PRICE_RE.search(qtext):
@@ -450,7 +274,7 @@ class DistributionAlignmentExperiment:
                 )
                 self._warned_blocks = True
             text = "\n".join(lines)
-        text = text[: self.cfg.max_persona_chars]
+        text = text[: self.config.max_persona_chars]
         self._personas[pid] = text
         return text
 
@@ -497,7 +321,7 @@ class DistributionAlignmentExperiment:
                 "binary",
             )
         if strategy == "knowledge_restriction":
-            extra = f"\nKNOWLEDGE LIMITS: {self.cfg.knowledge_restriction_text}"
+            extra = f"\nKNOWLEDGE LIMITS: {self.config.knowledge_restriction_text}"
             return (
                 self._respondent_system(persona, extra),
                 f"{q}\n\nReply with exactly one word: Yes or No.",
@@ -523,7 +347,7 @@ class DistributionAlignmentExperiment:
                 "prob",
             )
         if strategy == "population":
-            n = self.cfg.population_size
+            n = self.config.population_size
             system = (
                 "You are an expert in consumer behavior estimating how "
                 "groups of real shoppers respond to survey questions."
@@ -546,7 +370,7 @@ class DistributionAlignmentExperiment:
             (self.retest_items["pid"] == pid)
             & (self.retest_items["product_id"] != product_id)
         ]
-        k = min(self.cfg.fewshot_k, len(pool))
+        k = min(self.config.fewshot_k, len(pool))
         idx = self._task_rng("fewshot", pid, product_id).choice(
             len(pool), k, replace=False
         )
@@ -629,13 +453,13 @@ class DistributionAlignmentExperiment:
         max_tokens: int | None = None,
         json_mode: bool = False,
     ) -> str:
-        max_tokens = max_tokens or self.cfg.max_output_tokens
-        json_mode = json_mode and self.cfg.json_mode
+        max_tokens = max_tokens or self.config.max_output_tokens
+        json_mode = json_mode and self.config.json_mode
         key = hashlib.sha256(
             json.dumps(
                 [
                     self.client.model,
-                    self.cfg.temperature,
+                    self.config.temperature,
                     system,
                     user,
                     sample_idx,
@@ -648,20 +472,20 @@ class DistributionAlignmentExperiment:
         if cached is not None:
             return cached
         text = self.client.complete(
-            system, user, self.cfg.temperature, max_tokens, json_mode=json_mode
+            system, user, self.config.temperature, max_tokens, json_mode=json_mode
         )
         self.cache.set(key, text)
         return text
 
     def _task_rng(self, *parts) -> np.random.Generator:
-        h = hashlib.md5("|".join(map(str, (self.cfg.seed,) + parts)).encode())
+        h = hashlib.md5("|".join(map(str, (self.config.seed,) + parts)).encode())
         return np.random.default_rng(int(h.hexdigest()[:8], 16))
 
     def get_paraphrases(self, pid: str) -> list[str]:
         """Strategy 6: one call per twin returns k mutually diverse paraphrases."""
         if pid in self._paraphrases:
             return self._paraphrases[pid]
-        k = self.cfg.n_samples
+        k = self.config.n_samples
         system, user = self.paraphrase_prompt(self.build_persona(pid), k)
         text = self._call(
             system, user, sample_idx=-1, max_tokens=700 * k, json_mode=True
@@ -717,12 +541,12 @@ class DistributionAlignmentExperiment:
         if self.test_items is None:
             raise RuntimeError("Call select_test_set() first.")
         if strategy == "paraphrase":
-            with ThreadPoolExecutor(self.cfg.max_workers) as ex:
+            with ThreadPoolExecutor(self.config.max_workers) as ex:
                 list(ex.map(self.get_paraphrases, self.test_items["pid"].unique()))
         n = self.n_calls_per_item(strategy)
         tasks = [(item, s) for _, item in self.test_items.iterrows() for s in range(n)]
         out = []
-        with ThreadPoolExecutor(self.cfg.max_workers) as ex:
+        with ThreadPoolExecutor(self.config.max_workers) as ex:
             futs = [ex.submit(self._run_one, strategy, it, s) for it, s in tasks]
             for i, f in enumerate(as_completed(futs), 1):
                 out.append(f.result())
@@ -732,11 +556,11 @@ class DistributionAlignmentExperiment:
 
     def n_calls_per_item(self, strategy: str) -> int:
         return (
-            self.cfg.prob_samples if strategy in PROB_STRATEGIES else self.cfg.n_samples
+            self.config.prob_samples if strategy in PROB_STRATEGIES else self.config.n_samples
         )
 
     def run(self, strategies: tuple | None = None) -> pd.DataFrame:
-        frames = [self.run_strategy(s) for s in (strategies or self.cfg.strategies)]
+        frames = [self.run_strategy(s) for s in (strategies or self.config.strategies)]
         self.results = pd.concat(frames, ignore_index=True)
         return self.results
 
@@ -747,8 +571,8 @@ class DistributionAlignmentExperiment:
         return float(jensenshannon([p, 1 - p], [q, 1 - q], base=2) ** 2)
 
     def _bootstrap_ci(self, values: np.ndarray) -> tuple[float, float]:
-        rng = np.random.default_rng(self.cfg.seed)
-        idx = rng.integers(0, len(values), size=(self.cfg.n_bootstrap, len(values)))
+        rng = np.random.default_rng(self.config.seed)
+        idx = rng.integers(0, len(values), size=(self.config.n_bootstrap, len(values)))
         means = values[idx].mean(axis=1)
         return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
@@ -795,9 +619,9 @@ class DistributionAlignmentExperiment:
 
     def _simulate_shares(self, cell_probs: pd.DataFrame) -> np.ndarray:
         """Per-twin purchase shares when each cell is Bernoulli(prob)."""
-        rng = np.random.default_rng(self.cfg.seed)
+        rng = np.random.default_rng(self.config.seed)
         draws = (
-            rng.random((self.cfg.n_baseline_reps, len(cell_probs)))
+            rng.random((self.config.n_baseline_reps, len(cell_probs)))
             < cell_probs["prob"].to_numpy()
         )
         shares = []
@@ -891,9 +715,9 @@ class DistributionAlignmentExperiment:
         """Rank LLM strategies by how well they recover the human distribution.
 
         Three distributional criteria, each ranked (1 = best), then averaged:
-          - mean_JSD:        condition-level Bernoulli JSD (Moon et al.)
-          - het_wasserstein: distance of the per-twin purchase-share distribution
-          - |het_sd_ratio-1|: how close the person-level spread is to humans
+            - mean_JSD:        condition-level Bernoulli JSD (Moon et al.)
+            - het_wasserstein: distance of the per-twin purchase-share distribution
+            - |het_sd_ratio-1|: how close the person-level spread is to humans
         Also flags whether each strategy beats the marginal baseline, the
         reference no model beat for distributional fit in Moon et al.
         """
@@ -937,7 +761,7 @@ class DistributionAlignmentExperiment:
 
     # --------------------------------------------------------------- output
     def save(self, tag: str | None = None) -> str:
-        out = os.path.join(self.cfg.output_dir, tag or time.strftime("%Y%m%d_%H%M%S"))
+        out = os.path.join(self.config.output_dir, tag or time.strftime("%Y%m%d_%H%M%S"))
         os.makedirs(out, exist_ok=True)
         self.test_items.to_csv(os.path.join(out, "test_items.csv"), index=False)
         self.results.to_csv(os.path.join(out, "llm_responses.csv"), index=False)
@@ -947,7 +771,7 @@ class DistributionAlignmentExperiment:
             self.ranking.to_csv(os.path.join(out, "strategy_ranking.csv"))
         with open(os.path.join(out, "config.json"), "w") as f:
             json.dump(
-                asdict(self.cfg) | {"client_model": self.client.model}, f, indent=2
+                asdict(self.config) | {"client_model": self.client.model}, f, indent=2
             )
         if self._paraphrases:
             with open(os.path.join(out, "paraphrases.json"), "w") as f:
@@ -975,8 +799,8 @@ class DistributionAlignmentExperiment:
                 label=col,
             )
         ax[0].set(
-            title=f"Purchase rate by {self.cfg.condition_key}",
-            xlabel=self.cfg.condition_key,
+            title=f"Purchase rate by {self.config.condition_key}",
+            xlabel=self.config.condition_key,
             ylabel="purchase rate",
         )
         ax[0].tick_params(axis="x", rotation=45)
@@ -1010,98 +834,3 @@ class DistributionAlignmentExperiment:
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, "distribution_plots.png"), dpi=150)
         plt.close(fig)
-
-    # --------------------------------------------------------------- mock data
-    @staticmethod
-    def make_mock_dataset(
-        n_twins: int = 60, n_products: int = 40, seed: int = 0
-    ) -> pd.DataFrame:
-        """Synthetic data in the wave_split format, for offline pipeline tests."""
-        rng = np.random.default_rng(seed)
-        regular = np.round(rng.uniform(1.5, 8, n_products), 2)
-        rows = []
-        for pid in range(1, n_twins + 1):
-            age = int(rng.integers(18, 80))
-            income = rng.choice(
-                ["Less than $30,000", "$30,000-$69,999", "$70,000 or more"]
-            )
-            sens = rng.lognormal(0, 0.5)  # person-level price sensitivity
-            base = rng.normal(0.5, 1.0)  # person-level purchase propensity
-            demo = {
-                "ElementType": "Block",
-                "BlockName": "Demographics",
-                "Questions": [
-                    {
-                        "QuestionID": "QID13",
-                        "QuestionText": "How old are you?",
-                        "Answers": {"SelectedText": f"{age}"},
-                    },
-                    {
-                        "QuestionID": "QID20",
-                        "QuestionText": "What is your household income?",
-                        "Answers": {"SelectedText": str(income)},
-                    },
-                ],
-            }
-            econ = {
-                "ElementType": "Block",
-                "BlockName": "Economic preferences",
-                "Questions": [
-                    {
-                        "QuestionID": "QID300",
-                        "QuestionText": "How willing are you to take risks?",
-                        "Answers": {"SelectedText": str(int(rng.integers(0, 11)))},
-                    }
-                ],
-            }
-
-            def block(seed_off):
-                r2 = np.random.default_rng(seed * 1000 + pid * 10 + seed_off)
-                qs = []
-                for j in range(n_products):
-                    ratio = r2.integers(0, 11) * 0.2
-                    price = regular[j] * ratio
-                    p = 1 / (1 + np.exp(-(base + 1.5 - 2.5 * sens * ratio)))
-                    yes = r2.random() < p
-                    qs.append(
-                        {
-                            "QuestionID": f"QID{900 + j}",
-                            "QuestionText": (
-                                f"Please consider the following product category: Category {j % 8}. "
-                                "Suppose you are in a grocery store, and you see the following "
-                                f"product in that category: Product {j:02d}, 16 oz. "
-                                f"The product is priced at: ${price:.2f}. "
-                                "Would you or would you not purchase the product?"
-                            ),
-                            "Options": [
-                                "Yes, I would purchase the product",
-                                "No, I would not purchase the product",
-                            ],
-                            "Answers": {
-                                "SelectedByPosition": 1 if yes else 2,
-                                "SelectedText": (
-                                    "Yes, I would purchase the product"
-                                    if yes
-                                    else "No, I would not purchase the product"
-                                ),
-                            },
-                        }
-                    )
-                return [
-                    {
-                        "ElementType": "Block",
-                        "BlockName": "Product Preferences - Pricing",
-                        "Questions": qs,
-                    }
-                ]
-
-            rows.append(
-                dict(
-                    pid=str(pid),
-                    wave1_3_persona_text=f"Age: {age}. Income: {income}.",
-                    wave1_3_persona_json=json.dumps([demo, econ]),
-                    wave4_Q_wave4_A=json.dumps(block(4)),
-                    wave4_Q_wave1_3_A=json.dumps(block(3)),
-                )
-            )
-        return pd.DataFrame(rows)
