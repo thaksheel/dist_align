@@ -9,14 +9,14 @@ from src import (
     Twin2KDataset,
     LLMProvider,
     CloseModelSelection,
-    ResultsReporter
+    ResultsReporter,
 )
 
 load_dotenv()
 
 config = ExperimentConfig(
-    n_twins=10,
-    n_units=5,
+    n_twins=150,
+    n_units=30,
     strategies=(
         "direct",
         "verbalized",
@@ -25,8 +25,8 @@ config = ExperimentConfig(
         "knowledge_restriction",
         "paraphrase",
     ),
-    cache_path="./exports/llm_cache.jsonl", 
-    output_dir="./exports"
+    cache_path="./exports/llm_cache.jsonl",
+    output_dir="./exports",
 )
 provider = LLMProvider(
     provider="openai",
@@ -46,7 +46,7 @@ rda = RecoverDistributionAlignment(config, dataset, strategies, provider)
 print(dataset.report)
 print(f"{len(dataset.test_items)} items, ~{rda.n_calls_planned()} calls")
 
-df_results = rda.run()
+df_results = rda.run(parallel=True)
 df_eval = rda.evaluate()
 
 rr = ResultsReporter(rda)

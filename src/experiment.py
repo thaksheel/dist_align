@@ -2,11 +2,11 @@ import threading
 import time
 import pandas as pd
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import ExperimentConfig
 from .dataset import Twin2KDataset
 from .metrics import DistributionMetrics
-from .reporting import ResultsReporter
 from .strategies import Prompt, PromptStrategies
 from .utils import ResponseCache, stable_hash, task_rng
 from .llm_provider import LLMProvider
@@ -135,6 +135,15 @@ class RecoverDistributionAlignment:
             error=error,
         )
 
+    def n_calls_planned(self) -> int:
+        n = sum(
+            len(self.test_items) * self.strategies.n_calls(s)
+            for s in self.config.strategies
+        )
+        return n + self.test_items["pid"].nunique() * (
+            "paraphrase" in self.config.strategies
+        )
+
     def _remember(self, prompt: Prompt, response: str, **context) -> str:
         prompt_id = stable_hash(prompt.messages, 12)
         with self._lock:
@@ -175,6 +184,13 @@ class RecoverDistributionAlignment:
             ]
             self.paraphrases[pid] = [variants[i % len(variants)] for i in range(k)]
         return self.paraphrases[pid]
+
+    def _tasks(self, strategy: str, items: pd.DataFrame) -> list:
+        return [
+            (strategy, row, s)
+            for _, row in items.iterrows()
+            for s in range(self.strategies.n_calls(strategy))
+        ]
 
     def _run_one(self, strategy: str, item: pd.Series, s: int) -> dict:
         pid, unit = item["pid"], item[self.dataset.unit]
@@ -219,36 +235,51 @@ class RecoverDistributionAlignment:
             model=self.provider.model_name,
         )
 
-    def _run(self, strategies: tuple, items: pd.DataFrame) -> pd.DataFrame:
-        frames = []
-        for strategy in strategies:
+    def _run_sequential(self, strategy: str, items: pd.DataFrame) -> list:
+        if strategy == "paraphrase":
+            for pid in tqdm(items["pid"].unique(), desc="paraphrase personas"):
+                self.get_paraphrases(pid)
+        return [
+            self._run_one(*t) for t in tqdm(self._tasks(strategy, items), desc=strategy)
+        ]
+
+    def _run_parallel(self, strategy: str, items: pd.DataFrame) -> list:
+        with ThreadPoolExecutor(self.config.max_workers) as ex:
             if strategy == "paraphrase":
-                for pid in tqdm(items["pid"].unique(), desc="paraphrase personas"):
-                    self.get_paraphrases(pid)
-            tasks = [
-                (row, s)
-                for _, row in items.iterrows()
-                for s in range(self.strategies.n_calls(strategy))
-            ]
-            rows = [
-                self._run_one(strategy, row, s) for row, s in tqdm(tasks, desc=strategy)
-            ]
-            frames.append(pd.DataFrame(rows))
+                pids = items["pid"].unique()
+                list(
+                    tqdm(
+                        ex.map(self.get_paraphrases, pids),
+                        total=len(pids),
+                        desc="paraphrase personas",
+                    )
+                )
+            tasks = self._tasks(strategy, items)
+            return list(
+                tqdm(
+                    ex.map(lambda t: self._run_one(*t), tasks),
+                    total=len(tasks),
+                    desc=strategy,
+                )
+            )
+
+    def _run(
+        self, strategies: tuple, items: pd.DataFrame, parallel: bool
+    ) -> pd.DataFrame:
+        run_strategy = self._run_parallel if parallel else self._run_sequential
+        frames = [
+            pd.DataFrame(run_strategy(strategy, items)) for strategy in strategies
+        ]
         results = pd.concat(frames, ignore_index=True)
         results.insert(0, "call_id", range(len(results)))
         return results
 
-    def n_calls_planned(self) -> int:
-        n = sum(
-            len(self.test_items) * self.strategies.n_calls(s)
-            for s in self.config.strategies
+    def run(
+        self, strategies: tuple | None = None, parallel: bool = False
+    ) -> pd.DataFrame:
+        self.results = self._run(
+            strategies or self.config.strategies, self.test_items, parallel
         )
-        return n + self.test_items["pid"].nunique() * (
-            "paraphrase" in self.config.strategies
-        )
-
-    def run(self, strategies: tuple | None = None) -> pd.DataFrame:
-        self.results = self._run(strategies or self.config.strategies, self.test_items)
         return self.results
 
     def evaluate(self) -> pd.DataFrame:

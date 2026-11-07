@@ -257,7 +257,7 @@ class ResultsReporter:
         for ax in axes[:, 0]:
             ax.set_ylabel("Density")
         fig.suptitle(
-            "Per-twin purchase share: strategy vs human",
+            "Same Person purchase share: strategy vs human",
             x=0.01,
             ha="left",
             fontsize=12,
