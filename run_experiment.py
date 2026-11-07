@@ -1,21 +1,22 @@
+import os
 import pandas as pd
-import os 
 from dotenv import load_dotenv
 
 from src import (
-    DistributionAlignmentExperiment,
+    RecoverDistributionAlignment,
     ExperimentConfig,
     PromptStrategies,
     Twin2KDataset,
-    LLMProvider, 
-    CloseModelSelection
+    LLMProvider,
+    CloseModelSelection,
+    ResultsReporter
 )
 
 load_dotenv()
 
 config = ExperimentConfig(
-    n_twins=20,
-    n_units=10,
+    n_twins=10,
+    n_units=5,
     strategies=(
         "direct",
         "verbalized",
@@ -24,6 +25,8 @@ config = ExperimentConfig(
         "knowledge_restriction",
         "paraphrase",
     ),
+    cache_path="./exports/llm_cache.jsonl", 
+    output_dir="./exports"
 )
 provider = LLMProvider(
     provider="openai",
@@ -38,15 +41,17 @@ dataset = Twin2KDataset(config)
 dataset.load()
 dataset.select_test_set()
 strategies = PromptStrategies(config)
-experiment = DistributionAlignmentExperiment(config, dataset, strategies, provider)
+rda = RecoverDistributionAlignment(config, dataset, strategies, provider)
 
 print(dataset.report)
-print(f"{len(dataset.test_items)} items, ~{experiment.n_calls_planned()} calls")
-print(experiment.pilot())
+print(f"{len(dataset.test_items)} items, ~{rda.n_calls_planned()} calls")
 
-experiment.run()
-experiment.evaluate()
+df_results = rda.run()
+df_eval = rda.evaluate()
+
+rr = ResultsReporter(rda)
 with pd.option_context("display.width", 200, "display.precision", 3):
-    print(experiment.metrics)
-    print(experiment.ranking)
-print("Saved to", experiment.save())
+    print(rda.metrics)
+    print(rda.ranking)
+print("Saved to", rr.save())
+print("END")

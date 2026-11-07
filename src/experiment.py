@@ -1,8 +1,7 @@
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-
 import pandas as pd
+from tqdm import tqdm
 
 from .config import ExperimentConfig
 from .dataset import Twin2KDataset
@@ -10,9 +9,10 @@ from .metrics import DistributionMetrics
 from .reporting import ResultsReporter
 from .strategies import Prompt, PromptStrategies
 from .utils import ResponseCache, stable_hash, task_rng
+from .llm_provider import LLMProvider
 
 
-class DistributionAlignmentExperiment:
+class RecoverDistributionAlignment:
     """Runs prompting strategies on the test set, evaluates them and saves the results.
 
     Parameters
@@ -57,7 +57,7 @@ class DistributionAlignmentExperiment:
         config: ExperimentConfig,
         dataset: Twin2KDataset,
         strategies: PromptStrategies,
-        provider,
+        provider: LLMProvider,
     ):
         self.config = config
         self.dataset = dataset
@@ -222,19 +222,18 @@ class DistributionAlignmentExperiment:
     def _run(self, strategies: tuple, items: pd.DataFrame) -> pd.DataFrame:
         frames = []
         for strategy in strategies:
-            with ThreadPoolExecutor(self.workers) as ex:
-                if strategy == "paraphrase":
-                    list(ex.map(self.get_paraphrases, items["pid"].unique()))
-                tasks = [
-                    (row, s)
-                    for _, row in items.iterrows()
-                    for s in range(self.strategies.n_calls(strategy))
-                ]
-                frames.append(
-                    pd.DataFrame(
-                        list(ex.map(lambda t: self._run_one(strategy, *t), tasks))
-                    )
-                )
+            if strategy == "paraphrase":
+                for pid in tqdm(items["pid"].unique(), desc="paraphrase personas"):
+                    self.get_paraphrases(pid)
+            tasks = [
+                (row, s)
+                for _, row in items.iterrows()
+                for s in range(self.strategies.n_calls(strategy))
+            ]
+            rows = [
+                self._run_one(strategy, row, s) for row, s in tqdm(tasks, desc=strategy)
+            ]
+            frames.append(pd.DataFrame(rows))
         results = pd.concat(frames, ignore_index=True)
         results.insert(0, "call_id", range(len(results)))
         return results
@@ -247,19 +246,6 @@ class DistributionAlignmentExperiment:
         return n + self.test_items["pid"].nunique() * (
             "paraphrase" in self.config.strategies
         )
-
-    def pilot(self, n_items: int | None = None) -> pd.DataFrame:
-        items = self.test_items.sample(
-            n_items or self.config.pilot_items, random_state=self.config.seed
-        )
-        res = self._run(self.config.strategies, items)
-        summary = res.groupby("strategy", sort=False).agg(
-            parse_fail_rate=("parse_ok", lambda v: 1 - v.mean()),
-            errors=("error", "count"),
-            mean_predicted=("value", "mean"),
-        )
-        summary["human_rate"] = items["answer"].mean()
-        return summary
 
     def run(self, strategies: tuple | None = None) -> pd.DataFrame:
         self.results = self._run(strategies or self.config.strategies, self.test_items)
@@ -286,6 +272,3 @@ class DistributionAlignmentExperiment:
             output_tokens=("output_tokens", "sum"),
             mean_latency_s=("latency_s", "mean"),
         )
-
-    def save(self, tag: str | None = None) -> str:
-        return ResultsReporter(self).save(tag)

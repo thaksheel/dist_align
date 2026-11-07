@@ -2,8 +2,9 @@ import json
 import os
 import time
 from dataclasses import asdict
-
 import numpy as np
+
+from .experiment import RecoverDistributionAlignment
 
 
 class ResultsReporter:
@@ -20,10 +21,10 @@ class ResultsReporter:
 
         per_call_results.csv      one row per LLM call
         summary/                  metrics, strategy_ranking, condition_rates,
-                                  token_usage (.csv) and run_summary.json
+                                    token_usage (.csv) and run_summary.json
         data/                     test_items.csv, dataset_report.json
         prompts/                  examples.md, <strategy>.txt, examples.json,
-                                  paraphrases.json, all_prompts.jsonl
+                                    paraphrases.json, all_prompts.jsonl
         plots/                    demand_curves, heterogeneity, metric_summary (.png)
     """
 
@@ -38,24 +39,23 @@ class ResultsReporter:
     HUMAN, RETEST, BASELINE = "#1f1f1e", "#8a8984", "#c3c2b7"
     INK, MUTED, GRID = "#1f1f1e", "#5f5e5a", "#e6e5e0"
 
-    def __init__(self, experiment):
-        self.exp = experiment
-        self.cfg = experiment.config
+    def __init__(self, runner: RecoverDistributionAlignment):
+        self.runner = runner
+        self.cfg = runner.config
 
     def style(self, name: str) -> tuple:
         return self.STYLE.get(name, ("#6250d6", "X"))
 
     def save(self, tag: str | None = None) -> str:
-        exp = self.exp
-        if exp.metrics is None:
-            exp.evaluate()
+        if self.runner.metrics is None:
+            self.runner.evaluate()
         out = os.path.join(self.cfg.output_dir, tag or time.strftime("%Y%m%d_%H%M%S"))
         for sub in ("summary", "data", "prompts", "plots"):
             os.makedirs(os.path.join(out, sub), exist_ok=True)
-        exp.results.to_csv(os.path.join(out, "per_call_results.csv"), index=False)
-        exp.test_items.to_csv(os.path.join(out, "data", "test_items.csv"), index=False)
+        self.runner.results.to_csv(os.path.join(out, "per_call_results.csv"), index=False)
+        self.runner.test_items.to_csv(os.path.join(out, "data", "test_items.csv"), index=False)
         self.write_json(
-            os.path.join(out, "data", "dataset_report.json"), exp.dataset.report
+            os.path.join(out, "data", "dataset_report.json"), self.runner.dataset.report
         )
         self.save_summary(os.path.join(out, "summary"))
         self.save_prompts(os.path.join(out, "prompts"))
@@ -68,40 +68,38 @@ class ResultsReporter:
             json.dump(obj, f, indent=2, default=str)
 
     def save_summary(self, folder: str) -> None:
-        exp = self.exp
-        exp.metrics.to_csv(os.path.join(folder, "metrics.csv"))
-        exp.ranking.to_csv(os.path.join(folder, "strategy_ranking.csv"))
-        exp.condition_table().to_csv(os.path.join(folder, "condition_rates.csv"))
-        exp.token_usage().to_csv(os.path.join(folder, "token_usage.csv"))
+        self.runner.metrics.to_csv(os.path.join(folder, "metrics.csv"))
+        self.runner.ranking.to_csv(os.path.join(folder, "strategy_ranking.csv"))
+        self.runner.condition_table().to_csv(os.path.join(folder, "condition_rates.csv"))
+        self.runner.token_usage().to_csv(os.path.join(folder, "token_usage.csv"))
         self.write_json(
             os.path.join(folder, "run_summary.json"),
             dict(
-                started_at=exp.started_at,
+                started_at=self.runner.started_at,
                 saved_at=time.strftime("%Y-%m-%d %H:%M:%S"),
                 config=asdict(self.cfg) | {"token": None},
                 test_set=dict(
-                    items=len(exp.test_items),
-                    twins=exp.test_items["pid"].nunique(),
-                    units=exp.test_items[exp.dataset.unit].nunique(),
-                    items_per_condition=exp.test_items["condition"]
+                    items=len(self.runner.test_items),
+                    twins=self.runner.test_items["pid"].nunique(),
+                    units=self.runner.test_items[self.runner.dataset.unit].nunique(),
+                    items_per_condition=self.runner.test_items["condition"]
                     .value_counts()
                     .sort_index()
                     .to_dict(),
                 ),
                 calls=dict(
-                    total=len(exp.results),
-                    cached=int(exp.results["cached"].sum()),
-                    errors=int(exp.results["error"].count()),
+                    total=len(self.runner.results),
+                    cached=int(self.runner.results["cached"].sum()),
+                    errors=int(self.runner.results["error"].count()),
                 ),
-                best_strategy=exp.ranking.index[0],
-                any_beats_marginal_JSD=bool(exp.ranking["beats_marginal_JSD"].any()),
+                best_strategy=self.runner.ranking.index[0],
+                any_beats_marginal_JSD=bool(self.runner.ranking["beats_marginal_JSD"].any()),
             ),
         )
 
     def save_prompts(self, folder: str) -> None:
-        exp = self.exp
         md = ["# Prompt examples\n\nOne real call per strategy from this run.\n"]
-        for name, ex in exp.prompt_examples.items():
+        for name, ex in self.runner.prompt_examples.items():
             ctx = ", ".join(
                 f"{k}={ex[k]}" for k in ("pid", "unit", "sample_idx") if k in ex
             )
@@ -118,14 +116,14 @@ class ResultsReporter:
             )
         with open(os.path.join(folder, "examples.md"), "w", encoding="utf-8") as f:
             f.write("\n".join(md))
-        self.write_json(os.path.join(folder, "examples.json"), exp.prompt_examples)
-        if exp.paraphrases:
-            self.write_json(os.path.join(folder, "paraphrases.json"), exp.paraphrases)
-        if exp.all_prompts:
+        self.write_json(os.path.join(folder, "examples.json"), self.runner.prompt_examples)
+        if self.runner.paraphrases:
+            self.write_json(os.path.join(folder, "paraphrases.json"), self.runner.paraphrases)
+        if self.runner.all_prompts:
             with open(
                 os.path.join(folder, "all_prompts.jsonl"), "w", encoding="utf-8"
             ) as f:
-                f.writelines(json.dumps(r) + "\n" for r in exp.all_prompts.values())
+                f.writelines(json.dumps(r) + "\n" for r in self.runner.all_prompts.values())
 
     def plot(self, folder: str) -> None:
         import matplotlib
@@ -165,7 +163,7 @@ class ResultsReporter:
             plt.close(fig)
 
     def plot_demand_curves(self, plt):
-        ct = self.exp.condition_table()
+        ct = self.runner.condition_table()
         x = np.arange(len(ct))
         fig, ax = plt.subplots(figsize=(7.5, 4.5))
         ax.plot(
@@ -188,7 +186,7 @@ class ResultsReporter:
             ms=7,
             label="Human retest",
         )
-        for s in self.exp.results["strategy"].unique():
+        for s in self.runner.results["strategy"].unique():
             c, m = self.style(s)
             ax.plot(
                 x,
@@ -212,9 +210,9 @@ class ResultsReporter:
         return fig
 
     def plot_heterogeneity(self, plt):
-        exp, me = self.exp, self.exp.metrics_engine
-        human = me.human_shares(exp.test_items)
-        strategies = list(exp.results["strategy"].unique())
+        me = self.runner.metrics_engine
+        human = me.human_shares(self.runner.test_items)
+        strategies = list(self.runner.results["strategy"].unique())
         cols = min(3, len(strategies))
         rows = int(np.ceil(len(strategies) / cols))
         fig, axes = plt.subplots(
@@ -227,7 +225,7 @@ class ResultsReporter:
         )
         bins = np.linspace(0, 1, 11)
         for ax, s in zip(axes.flat, strategies):
-            valid = exp.results[exp.results["strategy"] == s].dropna(subset=["value"])
+            valid = self.runner.results[self.runner.results["strategy"] == s].dropna(subset=["value"])
             ax.hist(
                 human,
                 bins=bins,
@@ -247,7 +245,7 @@ class ResultsReporter:
                 label=s,
             )
             ax.set_title(
-                f"{s}  (SD ratio {exp.metrics.loc[s, 'het_sd_ratio']:.2f})",
+                f"{s}  (SD ratio {self.runner.metrics.loc[s, 'het_sd_ratio']:.2f})",
                 loc="left",
                 fontsize=10,
             )
@@ -269,7 +267,7 @@ class ResultsReporter:
         return fig
 
     def plot_metric_summary(self, plt):
-        m = self.exp.metrics.sort_values(
+        m = self.runner.metrics.sort_values(
             "type",
             key=lambda t: t.map({"strategy": 0, "baseline": 1, "reference": 2}),
             kind="stable",

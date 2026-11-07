@@ -1,6 +1,6 @@
 from .config import ExperimentConfig, LLMOut, CloseModelSelection, OpenModelSelection
 from .dataset import Twin2KDataset
-from .experiment import DistributionAlignmentExperiment
+from .experiment import RecoverDistributionAlignment
 from .metrics import DistributionMetrics
 from .reporting import ResultsReporter
 from .strategies import Prompt, PromptStrategies
@@ -12,7 +12,7 @@ __all__ = [
     "Twin2KDataset",
     "OpenModelSelection",
     "CloseModelSelection",
-    "DistributionAlignmentExperiment",
+    "RecoverDistributionAlignment",
     "DistributionMetrics",
     "ResultsReporter",
     "LLMProvider",
