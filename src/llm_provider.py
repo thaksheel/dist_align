@@ -5,16 +5,16 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     pipeline,
-    BitsAndBytesConfig, 
-    LogitsProcessor, 
-    LogitsProcessorList, 
-    TokenizersBackend, 
+    BitsAndBytesConfig,
+    LogitsProcessor,
+    LogitsProcessorList,
+    TokenizersBackend,
 )
 from langchain_huggingface import HuggingFacePipeline
 from langchain_openai import ChatOpenAI
 from langchain_core.language_models import BaseLLM
 
-from . import LLMOut
+from .config import LLMOut
 
 
 class ThinkingBudge(LogitsProcessor):
@@ -37,15 +37,15 @@ class ThinkingBudge(LogitsProcessor):
         for b in range(input_ids.shape[0]):
             ids = input_ids[b].tolist()
             if self.start not in ids:
-                continue 
-            s = len(ids) - 1 -ids[::-1].index(self.start)
-            if self.end in ids[s+1:]:
-                continue 
-            k = len(ids) - s - 1 - self.budget 
+                continue
+            s = len(ids) - 1 - ids[::-1].index(self.start)
+            if self.end in ids[s + 1 :]:
+                continue
+            k = len(ids) - s - 1 - self.budget
             if k >= 0:
                 scores[b, :] = float("-inf")
-                scores[b, self.forced[min(k, len(self.forced) -1)]] = 0.0 
-        return scores 
+                scores[b, self.forced[min(k, len(self.forced) - 1)]] = 0.0
+        return scores
 
 
 class LLMProvider:
@@ -57,7 +57,7 @@ class LLMProvider:
         max_new_tokens: int = 2048,
         temperature: float = 0.0,
         load_in_4bit: bool = True,
-        answer_reserve: int = 1024, 
+        answer_reserve: int = 1024,
     ):
         self.provider = provider
         self.model_name = model_name
@@ -76,7 +76,39 @@ class LLMProvider:
         elif provider == "openai":
             self.llm = self.init_openai(token)
 
-    def invoke(self, messages: List[Dict[str, str]], prompt: str = None) -> LLMOut:
+    @classmethod
+    def from_config(cls, config) -> "LLMProvider":
+        """Build a provider from an ExperimentConfig.
+
+        Parameters
+        ----------
+        config : ExperimentConfig
+            Uses `provider`, `model_name`, `temperature`, `token`,
+            `max_new_tokens` and `load_in_4bit`. A missing token is read from
+            OPENAI_API_KEY / OPENAI_TOKEN (openai) or HF_TOKEN (hf).
+        """
+        env = (
+            ("OPENAI_API_KEY", "OPENAI_TOKEN")
+            if config.provider == "openai"
+            else ("HF_TOKEN",)
+        )
+        token = config.token or next((os.getenv(k) for k in env if os.getenv(k)), None)
+        return cls(
+            provider=config.provider,
+            model_name=config.model_name,
+            token=token,
+            temperature=config.temperature,
+            max_new_tokens=config.max_new_tokens,
+            load_in_4bit=config.load_in_4bit,
+        )
+
+    def invoke(
+        self,
+        messages: List[Dict[str, str]],
+        prompt: str = None,
+        json_mode: bool = False,
+    ) -> LLMOut:
+        """json_mode asks OpenAI for a JSON object; it is ignored for local models."""
         if prompt is None:
             if self.provider == "hf":
                 p = self.build_prompt(messages)
@@ -89,13 +121,21 @@ class LLMProvider:
                     provider=self.provider,
                 )
             elif self.provider == "openai":
-                response = self.llm.invoke(messages)
-                usage = response.response_metadata["token_usage"]
+                llm = (
+                    self.llm.bind(response_format={"type": "json_object"})
+                    if json_mode
+                    else self.llm
+                )
+                response = llm.invoke(messages)
+                usage = response.response_metadata.get("token_usage") or {}
+                meta = getattr(response, "usage_metadata", None) or {}
                 response = response.content
                 return LLMOut(
                     response=response,
-                    input_token=usage["prompt_tokens"],
-                    output_token=usage["completion_tokens"],
+                    input_token=usage.get("prompt_tokens", meta.get("input_tokens")),
+                    output_token=usage.get(
+                        "completion_tokens", meta.get("output_tokens")
+                    ),
                     model_name=self.model_name,
                     provider=self.provider,
                 )
@@ -133,12 +173,14 @@ class LLMProvider:
             torch_dtype=torch.bfloat16,
             device_map="auto",
             token=token,
-        ) 
+        )
         gen_kwargs = {}
         vocab = self.tokenizer.get_vocab()
         if "<think>" in vocab and "</think>" in vocab:
-            budget = self.max_new_tokens - self.answer_reserve  
-            gen_kwargs['logits_processor'] = LogitsProcessorList([ThinkingBudge(self.tokenizer, budget)])
+            budget = self.max_new_tokens - self.answer_reserve
+            gen_kwargs["logits_processor"] = LogitsProcessorList(
+                [ThinkingBudge(self.tokenizer, budget)]
+            )
         pipe = pipeline(
             "text-generation",
             model=model,
@@ -147,7 +189,7 @@ class LLMProvider:
             do_sample=self.temperature > 0,
             temperature=self.temperature,
             return_full_text=False,
-            **gen_kwargs, 
+            **gen_kwargs,
         )
         return HuggingFacePipeline(pipeline=pipe)
 

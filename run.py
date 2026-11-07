@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
+from dotenv import load_dotenv 
 
 from src import (
     DistributionAlignmentExperiment,
@@ -9,11 +10,12 @@ from src import (
     STRATEGIES,
 )
 
+load_dotenv()
 config = ExperimentConfig(
     model="gpt-6-luna",
     temperature=1,
     strategies=("direct", "verbalized", "population", "fewshot_self"),
-    n_samples=3,
+    n_samples=1,
     prob_samples=1,
     persona_mode="blocks",
     persona_blocks=("Demographics", "Economic preferences"),
@@ -27,8 +29,8 @@ exp = DistributionAlignmentExperiment(config, client)
 # Select 200 test samples
 items = exp.load_data(source="hf")
 test_items = exp.select_test_set(
-    n_twins=20,
-    n_products=10,
+    n_twins=3, # 2058 people 
+    n_products=3, # 40 products 
 )  # n_twins x n_products = test samples
 n_items = len(exp.test_items)
 n_calls = sum(n_items * exp.n_calls_per_item(s) for s in STRATEGIES)
